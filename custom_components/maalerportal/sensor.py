@@ -276,6 +276,15 @@ class MaalerportalBaseSensor(SensorEntity):
         self._last_contact: Optional[datetime] = None
         self._last_reading_timestamp: Optional[str] = None
         
+        # Installation availability tracking (for 404 handling)
+        self._installation_available: bool = True
+        self._last_availability_check: Optional[datetime] = None
+        self._unavailable_since: Optional[datetime] = None
+        self._availability_check_count: int = 0
+        self._base_check_interval = timedelta(minutes=15)  # Base interval: 15 minutes
+        self._max_check_interval = timedelta(hours=24)  # Max interval: 24 hours
+        self._max_unavailable_days: int = 30  # Stop checking after 30 days
+        
         # Create base device name
         self._base_device_name = f"{installation['address']} - {installation['meterSerial']}"
         if installation.get("nickname"):
@@ -313,6 +322,11 @@ class MaalerportalBaseSensor(SensorEntity):
 
     async def async_update(self) -> None:
         """Fetch data from API."""
+        # If installation is unavailable, only do periodic availability checks
+        if not self._installation_available:
+            await self._check_installation_availability()
+            return
+        
         try:
             _LOGGER.debug("Fetching meter readings for installation: %s", self._installation_id)
             
@@ -326,6 +340,16 @@ class MaalerportalBaseSensor(SensorEntity):
                 if response.status == 429:
                     _LOGGER.warning("Rate limit exceeded, will retry later")
                     self._rate_limit_delay = min(self._rate_limit_delay * 2, 10000)
+                    return
+                
+                # Handle 404/403 - installation no longer accessible
+                if response.status in (404, 403):
+                    _LOGGER.warning(
+                        "Installation %s no longer accessible (HTTP %s), starting availability checks",
+                        self._installation_id,
+                        response.status
+                    )
+                    await self._handle_installation_unavailable()
                     return
                     
                 if not response.ok:
@@ -356,6 +380,139 @@ class MaalerportalBaseSensor(SensorEntity):
     async def _update_from_meter_counters(self, meter_counters: list[dict]) -> None:
         """Update sensor state from meter counter data - to be implemented by subclasses."""
         pass
+
+    async def _handle_installation_unavailable(self) -> None:
+        """Handle installation becoming unavailable (404/403 response).
+        
+        Marks the installation as unavailable and sets up periodic availability checks
+        with exponential backoff.
+        """
+        if not self._installation_available:
+            # Already marked as unavailable
+            return
+        
+        self._installation_available = False
+        self._unavailable_since = datetime.now(timezone.utc)
+        self._availability_check_count = 0
+        self._last_availability_check = datetime.now(timezone.utc)
+        _LOGGER.warning(
+            "Installation %s marked as unavailable. Will check periodically for restoration (max %d days).",
+            self._installation_id,
+            self._max_unavailable_days
+        )
+
+    def _get_current_check_interval(self) -> timedelta:
+        """Calculate current check interval using exponential backoff.
+        
+        Starts at 15 minutes, doubles each check, max 24 hours.
+        """
+        # Exponential backoff: 15min, 30min, 1hr, 2hr, 4hr, 8hr, 16hr, 24hr (max)
+        multiplier = 2 ** self._availability_check_count
+        interval = self._base_check_interval * multiplier
+        return min(interval, self._max_check_interval)
+
+    async def _check_installation_availability(self) -> bool:
+        """Check if the installation is available again.
+        
+        Checks the /addresses endpoint to see if the installation exists.
+        Uses exponential backoff and stops after max_unavailable_days.
+        
+        Returns True if installation is available, False otherwise.
+        """
+        now = datetime.now(timezone.utc)
+        
+        # Check if we've exceeded max unavailable days - stop checking
+        if self._unavailable_since:
+            days_unavailable = (now - self._unavailable_since).days
+            if days_unavailable >= self._max_unavailable_days:
+                _LOGGER.warning(
+                    "Installation %s has been unavailable for %d days (max: %d). "
+                    "Stopping availability checks. Re-configure integration if access is restored.",
+                    self._installation_id,
+                    days_unavailable,
+                    self._max_unavailable_days
+                )
+                return False
+        
+        # Calculate current check interval based on exponential backoff
+        current_interval = self._get_current_check_interval()
+        
+        # Throttle availability checks based on current interval
+        if self._last_availability_check:
+            time_since_last_check = now - self._last_availability_check
+            if time_since_last_check < current_interval:
+                _LOGGER.debug(
+                    "Skipping availability check (last check was %s ago, current interval is %s)",
+                    time_since_last_check,
+                    current_interval
+                )
+                return False
+        
+        # Increment check count for exponential backoff
+        self._availability_check_count += 1
+        self._last_availability_check = now
+        
+        try:
+            _LOGGER.debug(
+                "Checking if installation %s is available again (check #%d, next interval: %s)...",
+                self._installation_id,
+                self._availability_check_count,
+                self._get_current_check_interval()
+            )
+            
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+                response = await session.get(
+                    f"{self._smarthome_base_url}/addresses",
+                    headers={"ApiKey": self._api_key},
+                )
+                
+                if response.status == 429:
+                    _LOGGER.warning("Rate limit exceeded during availability check")
+                    return False
+                
+                if not response.ok:
+                    _LOGGER.debug("Availability check failed: HTTP %s", response.status)
+                    return False
+                
+                addresses = await response.json()
+                
+                # Check if our installation exists in the list
+                installation_found = False
+                for address in addresses:
+                    for installation in address.get("installations", []):
+                        if installation.get("installationId") == self._installation_id:
+                            installation_found = True
+                            break
+                    if installation_found:
+                        break
+                
+                if installation_found:
+                    _LOGGER.info(
+                        "Installation %s found again! Resuming normal operation.",
+                        self._installation_id
+                    )
+                    # Reset all availability tracking state
+                    self._installation_available = True
+                    self._unavailable_since = None
+                    self._availability_check_count = 0
+                    return True
+                else:
+                    _LOGGER.debug(
+                        "Installation %s still not found (check #%d), next check in %s",
+                        self._installation_id,
+                        self._availability_check_count,
+                        self._get_current_check_interval()
+                    )
+                    return False
+                    
+        except asyncio.TimeoutError:
+            _LOGGER.warning("Timeout during availability check for installation %s", self._installation_id)
+        except aiohttp.ClientError as err:
+            _LOGGER.error("Connection error during availability check: %s", err)
+        except Exception as err:
+            _LOGGER.exception("Unexpected error during availability check: %s", err)
+        
+        return False
 
     def _parse_counter_value(self, counter: dict) -> Optional[float]:
         """Parse and validate counter value."""
@@ -967,6 +1124,11 @@ class MaalerportalConsumptionSensor(MaalerportalBaseSensor, RestoreEntity):
     @Throttle(timedelta(hours=1))
     async def async_update(self) -> None:
         """Fetch new consumption data and update cumulative sum."""
+        # If installation is unavailable, only do periodic availability checks
+        if not self._installation_available:
+            await self._check_installation_availability()
+            return
+        
         if self._initialized:
             await self._fetch_and_accumulate()
 
@@ -1006,6 +1168,16 @@ class MaalerportalConsumptionSensor(MaalerportalBaseSensor, RestoreEntity):
                 
                 if response.status == 429:
                     _LOGGER.warning("Rate limit exceeded for historical data, will retry later")
+                    return
+                
+                # Handle 404/403 - installation no longer accessible
+                if response.status in (404, 403):
+                    _LOGGER.warning(
+                        "Installation %s no longer accessible (HTTP %s)",
+                        self._installation_id,
+                        response.status
+                    )
+                    await self._handle_installation_unavailable()
                     return
                 
                 if not response.ok:
@@ -1436,6 +1608,11 @@ class MaalerportalStatisticSensor(MaalerportalBaseSensor, RestoreEntity):
     @Throttle(timedelta(minutes=30))
     async def async_update(self) -> None:
         """Update statistics from historical API data."""
+        # If installation is unavailable, only do periodic availability checks
+        if not self._installation_available:
+            await self._check_installation_availability()
+            return
+        
         await self._async_update_statistics()
 
     async def _async_update_statistics(self) -> None:
@@ -1491,6 +1668,16 @@ class MaalerportalStatisticSensor(MaalerportalBaseSensor, RestoreEntity):
                 
                 if response.status == 429:
                     _LOGGER.warning("Rate limit exceeded for statistics data, will retry later")
+                    return
+                
+                # Handle 404/403 - installation no longer accessible
+                if response.status in (404, 403):
+                    _LOGGER.warning(
+                        "Installation %s no longer accessible (HTTP %s)",
+                        self._installation_id,
+                        response.status
+                    )
+                    await self._handle_installation_unavailable()
                     return
                 
                 if not response.ok:
