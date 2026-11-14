@@ -1728,7 +1728,7 @@ class MaalerportalStatisticSensor(MaalerportalBaseSensor, RestoreEntity):
                 1,
                 self._statistic_id,
                 True,
-                {"sum"},
+                {"sum", "state"},
             )
             
             has_existing_stats = bool(last_stats and self._statistic_id in last_stats)
@@ -1810,14 +1810,28 @@ class MaalerportalStatisticSensor(MaalerportalBaseSensor, RestoreEntity):
                 # Sort by timestamp
                 counter_readings.sort(key=lambda x: x.get("timestamp", ""))
                 
-                # For counter-type meters without existing statistics:
-                # Use the first reading as a baseline and subtract it from all values
-                # This prevents the Energy Dashboard from showing massive consumption (0 to current meter value)
-                # Instead, consumption starts from 0 and only shows the delta from the first reading
+                # For counter-type meters, sum = meter reading - baseline, so the Energy
+                # Dashboard starts near 0 instead of showing the meter's whole lifetime
+                # total as consumption.
+                # - No existing statistics: the baseline is the first reading.
+                # - Existing statistics: the baseline is the offset already stored
+                #   (last state - last sum). It must be reused on every later import,
+                #   or re-imported and new rows get sum = raw meter reading and the
+                #   dashboard shows a jump the size of the meter reading.
                 counter_baseline = None
-                if self._reading_type != "consumption" and not has_existing_stats:
-                    # Get the first reading value as baseline
-                    if counter_readings:
+                if self._reading_type != "consumption":
+                    if has_existing_stats:
+                        last_stat = last_stats[self._statistic_id][0]
+                        last_state = last_stat.get("state")
+                        last_sum = last_stat.get("sum")
+                        if last_state is not None and last_sum is not None:
+                            counter_baseline = float(last_state) - float(last_sum)
+                            _LOGGER.debug(
+                                "Using baseline from existing statistics: %s (state %s - sum %s)",
+                                counter_baseline, last_state, last_sum
+                            )
+                    elif counter_readings:
+                        # Get the first reading value as baseline
                         first_value = counter_readings[0].get("value")
                         if first_value is not None:
                             if isinstance(first_value, str):
